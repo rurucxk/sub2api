@@ -67,6 +67,12 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if err != nil {
 		return nil, fmt.Errorf("apply grok Free function-tool cache route: %w", err)
 	}
+	// Plan A: snapshot main-dialogue tools; rewrite idle recap tools to that snapshot
+	// so prompt-cache prefix is not broken by Build stripping to web_search/x_search.
+	patchedBody, err = applyGrokIdleStickyToolsPlanA(getAPIKeyIDFromContext(c), patchedBody, body)
+	if err != nil {
+		return nil, fmt.Errorf("apply grok idle sticky tools (plan A): %w", err)
+	}
 
 	token, _, err := s.getRequestCredential(ctx, c, account)
 	if err != nil {

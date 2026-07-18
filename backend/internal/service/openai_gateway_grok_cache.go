@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -16,7 +18,22 @@ const (
 	grokFreeCacheNativeToolsJSON    = `[{"type":"web_search"},{"type":"x_search"}]`
 	grokFreeCacheDisabledToolChoice = "none"
 	grokFreeRolling24hTokenLimit    = int64(2_000_000)
+
+	// Plan B + A: keep main-dialogue prompt_cache_key and tools snapshot across
+	// Grok Build idle recap so upstream prompt cache is not broken by stripped tools.
+	grokMainCacheIdentityTTL = 2 * time.Hour
+	// Cap stored tools JSON to avoid unbounded memory if a client floods tool schemas.
+	grokMainToolsSnapshotMaxBytes = 1 << 20
 )
+
+type grokMainCacheIdentityEntry struct {
+	identity  string
+	toolsRaw  string // plan A: last main-dialogue tools array JSON
+	expiresAt time.Time
+}
+
+var grokMainCacheIdentityMu sync.Mutex
+var grokMainCacheIdentityByAPIKey = map[int64]grokMainCacheIdentityEntry{}
 
 // resolveGrokCacheIdentity derives one stable, tenant-isolated routing identity
 // for xAI's server-side prompt cache. The returned value is safe to expose to
@@ -25,6 +42,10 @@ const (
 // A valid downstream API key is required. This intentionally fails closed on
 // internal probes and incomplete request contexts instead of creating a cache
 // identity that could be shared by unrelated tenants.
+//
+// Idle-recap-like Grok Build requests often strip client function tools, which
+// changes the content-derived seed and would mint a new UUID. When possible we
+// reuse the last main-dialogue identity for the same API key (plan B).
 func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstreamModel string) string {
 	apiKeyID := getAPIKeyIDFromContext(c)
 	if apiKeyID <= 0 {
@@ -60,7 +81,214 @@ func resolveGrokCacheIdentity(c *gin.Context, body []byte, explicitKey, upstream
 	// Include a versioned namespace so this identity cannot collide with other
 	// upstream session identifiers derived by sub2api.
 	isolatedSeed := fmt.Sprintf("grok-prompt-cache:v1:%d:%s:%s", apiKeyID, model, seed)
-	return generateSessionUUID(isolatedSeed)
+	identity := generateSessionUUID(isolatedSeed)
+	return applyGrokIdleStickyCacheIdentity(apiKeyID, body, identity)
+}
+
+// applyGrokIdleStickyCacheIdentity implements plan B:
+//   - main dialogue (has multiple function tools): remember identity
+//   - idle-recap-like (stripped tools / idle marker): reuse remembered identity
+func applyGrokIdleStickyCacheIdentity(apiKeyID int64, body []byte, identity string) string {
+	if apiKeyID <= 0 {
+		return identity
+	}
+	if isGrokIdleRecapLikeRequest(body) {
+		if prev := loadGrokMainCacheIdentity(apiKeyID); prev != "" {
+			return prev
+		}
+		return identity
+	}
+	if identity != "" && isGrokMainDialogueCacheRequest(body) {
+		storeGrokMainCacheIdentity(apiKeyID, identity)
+	}
+	return identity
+}
+
+func storeGrokMainCacheIdentity(apiKeyID int64, identity string) {
+	identity = strings.TrimSpace(identity)
+	if apiKeyID <= 0 || identity == "" {
+		return
+	}
+	grokMainCacheIdentityMu.Lock()
+	defer grokMainCacheIdentityMu.Unlock()
+	pruneGrokMainCacheIdentityLocked(time.Now())
+	entry := grokMainCacheIdentityByAPIKey[apiKeyID]
+	entry.identity = identity
+	entry.expiresAt = time.Now().Add(grokMainCacheIdentityTTL)
+	grokMainCacheIdentityByAPIKey[apiKeyID] = entry
+}
+
+func loadGrokMainCacheIdentity(apiKeyID int64) string {
+	if apiKeyID <= 0 {
+		return ""
+	}
+	grokMainCacheIdentityMu.Lock()
+	defer grokMainCacheIdentityMu.Unlock()
+	entry, ok := grokMainCacheIdentityByAPIKey[apiKeyID]
+	if !ok {
+		return ""
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(grokMainCacheIdentityByAPIKey, apiKeyID)
+		return ""
+	}
+	return entry.identity
+}
+
+func storeGrokMainToolsSnapshot(apiKeyID int64, toolsRaw string) {
+	toolsRaw = strings.TrimSpace(toolsRaw)
+	if apiKeyID <= 0 || toolsRaw == "" {
+		return
+	}
+	if len(toolsRaw) > grokMainToolsSnapshotMaxBytes {
+		return
+	}
+	// Must be a JSON array; reject garbage so idle rewrite cannot corrupt upstream.
+	if !gjson.Valid(toolsRaw) || !gjson.Parse(toolsRaw).IsArray() {
+		return
+	}
+	grokMainCacheIdentityMu.Lock()
+	defer grokMainCacheIdentityMu.Unlock()
+	pruneGrokMainCacheIdentityLocked(time.Now())
+	entry := grokMainCacheIdentityByAPIKey[apiKeyID]
+	entry.toolsRaw = toolsRaw
+	entry.expiresAt = time.Now().Add(grokMainCacheIdentityTTL)
+	grokMainCacheIdentityByAPIKey[apiKeyID] = entry
+}
+
+func loadGrokMainToolsSnapshot(apiKeyID int64) string {
+	if apiKeyID <= 0 {
+		return ""
+	}
+	grokMainCacheIdentityMu.Lock()
+	defer grokMainCacheIdentityMu.Unlock()
+	entry, ok := grokMainCacheIdentityByAPIKey[apiKeyID]
+	if !ok {
+		return ""
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(grokMainCacheIdentityByAPIKey, apiKeyID)
+		return ""
+	}
+	return entry.toolsRaw
+}
+
+func pruneGrokMainCacheIdentityLocked(now time.Time) {
+	for k, v := range grokMainCacheIdentityByAPIKey {
+		if now.After(v.expiresAt) {
+			delete(grokMainCacheIdentityByAPIKey, k)
+		}
+	}
+}
+
+// resetGrokMainCacheIdentityStoreForTest clears sticky identities (unit tests).
+func resetGrokMainCacheIdentityStoreForTest() {
+	grokMainCacheIdentityMu.Lock()
+	defer grokMainCacheIdentityMu.Unlock()
+	grokMainCacheIdentityByAPIKey = map[int64]grokMainCacheIdentityEntry{}
+}
+
+// applyGrokIdleStickyToolsPlanA implements plan A:
+//   - main dialogue: remember the final upstream tools array for this API key
+//   - idle recap: rewrite stripped 2-tool payloads back to the remembered tools
+//     so xAI prompt-cache prefix still matches; remove the idle-only
+//     tool_choice=none field so the following normal turn keeps the same shape.
+//
+// intentSourceBody is the pre-patch client body (idle markers / tool intent).
+// patchedBody is the body about to be sent upstream (may already include free-tier
+// native tools append).
+func applyGrokIdleStickyToolsPlanA(apiKeyID int64, patchedBody, intentSourceBody []byte) ([]byte, error) {
+	if apiKeyID <= 0 || len(patchedBody) == 0 {
+		return patchedBody, nil
+	}
+	detectBody := intentSourceBody
+	if len(detectBody) == 0 {
+		detectBody = patchedBody
+	}
+
+	if isGrokIdleRecapLikeRequest(detectBody) {
+		snap := loadGrokMainToolsSnapshot(apiKeyID)
+		if snap == "" {
+			return patchedBody, nil
+		}
+		out, err := sjson.SetRawBytes(patchedBody, "tools", []byte(snap))
+		if err != nil {
+			return nil, err
+		}
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(out, "tool_choice").String()), grokFreeCacheDisabledToolChoice) {
+			return sjson.DeleteBytes(out, "tool_choice")
+		}
+		return out, nil
+	}
+
+	// Remember tools from main multi-function dialogue after free-tier merge.
+	if isGrokMainDialogueCacheRequest(detectBody) || isGrokMainDialogueCacheRequest(patchedBody) {
+		tools := gjson.GetBytes(patchedBody, "tools")
+		if tools.Exists() && tools.IsArray() && len(tools.Array()) >= 3 {
+			storeGrokMainToolsSnapshot(apiKeyID, tools.Raw)
+		}
+	}
+	return patchedBody, nil
+}
+
+// isGrokIdleRecapLikeRequest detects Grok Build idle recap / stripped-tool turns
+// that should reuse the previous main-dialogue cache routing identity.
+func isGrokIdleRecapLikeRequest(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	raw := string(body)
+	if strings.Contains(raw, "returning from idle") ||
+		strings.Contains(raw, "Write ONE sentence recap") ||
+		strings.Contains(raw, "Recap —") ||
+		strings.Contains(raw, "Recap -") {
+		return true
+	}
+
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() || len(tools.Array()) == 0 {
+		// Tool-less alone is not enough (could be a probe); require idle markers.
+		return false
+	}
+
+	functionTools := 0
+	onlyNativeSearch := true
+	for _, tool := range tools.Array() {
+		typ := strings.TrimSpace(tool.Get("type").String())
+		switch typ {
+		case "function":
+			functionTools++
+			onlyNativeSearch = false
+		case "web_search", "x_search":
+			// ok
+		default:
+			onlyNativeSearch = false
+		}
+	}
+	if functionTools > 0 {
+		return false
+	}
+	// Native-search-only with tool_choice=none is how free-tier injects idle-like
+	// requests after stripping client tools; still require an idle-ish signal when
+	// markers above did not match, to avoid false positives on pure tool-less tests.
+	_ = onlyNativeSearch
+	return false
+}
+
+// isGrokMainDialogueCacheRequest reports whether the request carries a normal
+// multi-function-tool Grok Build / Claude Code dialogue shape worth remembering.
+func isGrokMainDialogueCacheRequest(body []byte) bool {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return false
+	}
+	functionTools := 0
+	for _, tool := range tools.Array() {
+		if strings.TrimSpace(tool.Get("type").String()) == "function" {
+			functionTools++
+		}
+	}
+	return functionTools >= 3
 }
 
 func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) string {

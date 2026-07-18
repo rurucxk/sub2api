@@ -564,3 +564,137 @@ func TestResolveGrokCacheIdentityConcurrentDeterminism(t *testing.T) {
 	}
 	require.NotEmpty(t, first)
 }
+
+func TestGrokIdleStickyCacheIdentityPlanB(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetGrokMainCacheIdentityStoreForTest()
+	defer resetGrokMainCacheIdentityStoreForTest()
+
+	c := newGrokCacheTestContext(9001)
+	mainBody := []byte(`{
+		"model":"grok-4.5",
+		"tools":[
+			{"type":"function","name":"run_terminal_command"},
+			{"type":"function","name":"read_file"},
+			{"type":"function","name":"write"},
+			{"type":"web_search"},
+			{"type":"x_search"}
+		],
+		"input":[{"type":"message","role":"user","content":"hello main"}]
+	}`)
+	idleBody := []byte(`{
+		"model":"grok-4.5",
+		"tools":[{"type":"web_search"},{"type":"x_search"}],
+		"tool_choice":"none",
+		"input":[{"type":"message","role":"user","content":"<system-reminder>Write ONE sentence recap body for a user returning from idle. Output ONLY the body</system-reminder>"}]
+	}`)
+	// Idle with different tools/prefix would mint a different key without sticky.
+	otherIdleKey := resolveGrokCacheIdentity(newGrokCacheTestContext(9002), idleBody, "", "grok-4.5")
+	require.NotEmpty(t, otherIdleKey)
+
+	mainKey := resolveGrokCacheIdentity(c, mainBody, "", "grok-4.5")
+	require.NotEmpty(t, mainKey)
+	require.True(t, isGrokMainDialogueCacheRequest(mainBody))
+	require.True(t, isGrokIdleRecapLikeRequest(idleBody))
+
+	idleKey := resolveGrokCacheIdentity(c, idleBody, "", "grok-4.5")
+	require.Equal(t, mainKey, idleKey, "idle recap must reuse sticky main dialogue cache key")
+}
+
+func TestGrokIdleStickyDoesNotReuseAcrossAPIKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetGrokMainCacheIdentityStoreForTest()
+	defer resetGrokMainCacheIdentityStoreForTest()
+
+	mainBody := []byte(`{"model":"grok-4.5","tools":[{"type":"function","name":"a"},{"type":"function","name":"b"},{"type":"function","name":"c"}],"input":[{"role":"user","content":"hi"}]}`)
+	idleBody := []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"returning from idle write recap"}]}`)
+
+	keyA := resolveGrokCacheIdentity(newGrokCacheTestContext(9101), mainBody, "", "grok-4.5")
+	keyBIdle := resolveGrokCacheIdentity(newGrokCacheTestContext(9102), idleBody, "", "grok-4.5")
+	require.NotEmpty(t, keyA)
+	require.NotEmpty(t, keyBIdle)
+	require.NotEqual(t, keyA, keyBIdle)
+}
+
+func TestIsGrokIdleRecapLikeRequestMarkers(t *testing.T) {
+	require.True(t, isGrokIdleRecapLikeRequest([]byte(`{"input":"Write ONE sentence recap body for a user returning from idle"}`)))
+	require.False(t, isGrokIdleRecapLikeRequest([]byte(`{"tools":[{"type":"function","name":"x"}],"input":"hello"}`)))
+	require.False(t, isGrokIdleRecapLikeRequest([]byte(`{"tools":[{"type":"web_search"}],"input":"normal search ask"}`)))
+}
+
+func TestGrokIdleStickyToolsPlanA(t *testing.T) {
+	resetGrokMainCacheIdentityStoreForTest()
+	defer resetGrokMainCacheIdentityStoreForTest()
+
+	apiKeyID := int64(9201)
+	c := newGrokCacheTestContext(apiKeyID)
+	mainBody := []byte(`{
+		"model":"grok-4.5",
+		"tools":[
+			{"type":"function","name":"run_terminal_command"},
+			{"type":"function","name":"read_file"},
+			{"type":"function","name":"write"},
+			{"type":"web_search"},
+			{"type":"x_search"}
+		],
+		"input":[{"type":"message","role":"user","content":"hello main"}]
+	}`)
+	idleBody := []byte(`{
+		"model":"grok-4.5",
+		"tools":[{"type":"web_search"},{"type":"x_search"}],
+		"tool_choice":"none",
+		"input":[{"type":"message","role":"user","content":"<system-reminder>Write ONE sentence recap body for a user returning from idle. Output ONLY the body</system-reminder>"}]
+	}`)
+	postIdleBody := []byte(`{
+		"model":"grok-4.5",
+		"tools":[
+			{"type":"function","name":"run_terminal_command"},
+			{"type":"function","name":"read_file"},
+			{"type":"function","name":"write"},
+			{"type":"web_search"},
+			{"type":"x_search"}
+		],
+		"input":[
+			{"type":"message","role":"user","content":"hello main"},
+			{"type":"message","role":"assistant","content":"idle recap"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	// No snapshot yet: idle passes through.
+	passthrough, err := applyGrokIdleStickyToolsPlanA(apiKeyID, idleBody, idleBody)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(gjson.GetBytes(passthrough, "tools").Array()))
+
+	// Main dialogue stores final tools.
+	mainKey := resolveGrokCacheIdentity(c, mainBody, "", "grok-4.5")
+	stored, err := applyGrokIdleStickyToolsPlanA(apiKeyID, mainBody, mainBody)
+	require.NoError(t, err)
+	require.NotEmpty(t, mainKey)
+	require.Equal(t, 5, len(gjson.GetBytes(stored, "tools").Array()))
+	require.NotEmpty(t, loadGrokMainToolsSnapshot(apiKeyID))
+
+	// Idle reuses the main cache key and tools without leaving an idle-only
+	// tool_choice field that would change the next normal request shape.
+	idleKey := resolveGrokCacheIdentity(c, idleBody, "", "grok-4.5")
+	rewritten, err := applyGrokIdleStickyToolsPlanA(apiKeyID, idleBody, idleBody)
+	require.NoError(t, err)
+	tools := gjson.GetBytes(rewritten, "tools").Array()
+	require.Equal(t, mainKey, idleKey)
+	require.Equal(t, 5, len(tools))
+	require.Equal(t, "run_terminal_command", tools[0].Get("name").String())
+	require.False(t, gjson.GetBytes(rewritten, "tool_choice").Exists())
+
+	// The first normal turn after idle keeps the same cache identity and tools.
+	postIdleKey := resolveGrokCacheIdentity(c, postIdleBody, "", "grok-4.5")
+	postIdle, err := applyGrokIdleStickyToolsPlanA(apiKeyID, postIdleBody, postIdleBody)
+	require.NoError(t, err)
+	require.Equal(t, mainKey, postIdleKey)
+	require.Equal(t, gjson.GetBytes(stored, "tools").Raw, gjson.GetBytes(postIdle, "tools").Raw)
+	require.False(t, gjson.GetBytes(postIdle, "tool_choice").Exists())
+
+	// Tenant isolation: other API key must not see the snapshot.
+	other, err := applyGrokIdleStickyToolsPlanA(9202, idleBody, idleBody)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(gjson.GetBytes(other, "tools").Array()))
+}
