@@ -23,6 +23,12 @@ func newGrokCacheTestContext(apiKeyID int64) *gin.Context {
 	return c
 }
 
+func resetGrokMainCacheIdentityStoreForTest() {
+	grokMainCacheIdentityMu.Lock()
+	defer grokMainCacheIdentityMu.Unlock()
+	grokMainCacheIdentityByAPIKey = map[int64]grokMainCacheIdentityEntry{}
+}
+
 func TestResolveGrokCacheIdentityStableAcrossAppendOnlyTurns(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c := newGrokCacheTestContext(101)

@@ -182,13 +182,6 @@ func pruneGrokMainCacheIdentityLocked(now time.Time) {
 	}
 }
 
-// resetGrokMainCacheIdentityStoreForTest clears sticky identities (unit tests).
-func resetGrokMainCacheIdentityStoreForTest() {
-	grokMainCacheIdentityMu.Lock()
-	defer grokMainCacheIdentityMu.Unlock()
-	grokMainCacheIdentityByAPIKey = map[int64]grokMainCacheIdentityEntry{}
-}
-
 // applyGrokIdleStickyToolsPlanA implements plan A:
 //   - main dialogue: remember the final upstream tools array for this API key
 //   - idle recap: rewrite stripped 2-tool payloads back to the remembered tools
