@@ -17,7 +17,8 @@ const (
 	grokConversationIDHeader        = "X-Grok-Conv-Id"
 	grokFreeCacheNativeToolsJSON    = `[{"type":"web_search"},{"type":"x_search"}]`
 	grokFreeCacheDisabledToolChoice = "none"
-	grokFreeRolling24hTokenLimit    = int64(2_000_000)
+	grokFreeRolling24hTokenLimit    = int64(1_000_000)
+	grokLegacyFree24hTokenLimit     = int64(2_000_000)
 
 	// Plan B + A: keep main-dialogue prompt_cache_key and tools snapshot across
 	// Grok Build idle recap so upstream prompt cache is not broken by stripped tools.
@@ -415,7 +416,7 @@ func isKnownGrokFreeAccount(account *Account) bool {
 			}
 		}
 		if snapshot.Tokens != nil && snapshot.Tokens.Limit != nil &&
-			*snapshot.Tokens.Limit == grokFreeRolling24hTokenLimit {
+			isKnownGrokFreeTokenLimit(*snapshot.Tokens.Limit) {
 			inferredFreeSignal = true
 		}
 	}
@@ -430,6 +431,10 @@ func isKnownGrokFreeAccount(account *Account) bool {
 	// protects upgraded/stale accounts whose previous quota snapshot still
 	// carries the historical 2M Free token limit.
 	return !paidSignal && (freeSignal || inferredFreeSignal)
+}
+
+func isKnownGrokFreeTokenLimit(limit int64) bool {
+	return limit == grokFreeRolling24hTokenLimit || limit == grokLegacyFree24hTokenLimit
 }
 
 func isGrokFreeSubscriptionTier(tier string) bool {
